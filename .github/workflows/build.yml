@@ -1,0 +1,66 @@
+name: Build unsigned IPA
+
+# Builds SelfShot on a GitHub-hosted macOS runner and uploads an unsigned
+# .ipa. You then sign it locally with Sideloadly using your free Apple ID.
+# Keep this repo PUBLIC — macOS runner minutes bill at 10x on private repos.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show available Xcode versions
+        run: ls /Applications | grep Xcode
+
+      - name: Select latest Xcode
+        run: sudo xcode-select -s /Applications/Xcode.app
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Build (unsigned)
+        run: |
+          xcodebuild \
+            -project SelfShot.xcodeproj \
+            -scheme SelfShot \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            ONLY_ACTIVE_ARCH=NO \
+            | xcpretty || exit ${PIPESTATUS[0]}
+
+      - name: Package into .ipa
+        run: |
+          APP_PATH="build/Build/Products/Release-iphoneos/SelfShot.app"
+          if [ ! -d "$APP_PATH" ]; then
+            echo "Build product not found at $APP_PATH"
+            find build -name "*.app" -maxdepth 6
+            exit 1
+          fi
+          mkdir -p out/Payload
+          cp -R "$APP_PATH" out/Payload/
+          cd out
+          zip -qr SelfShot.ipa Payload
+          cd ..
+          ls -lh out/SelfShot.ipa
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SelfShot-ipa
+          path: out/SelfShot.ipa
+          retention-days: 30
