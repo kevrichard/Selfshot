@@ -12,7 +12,21 @@ targets:
     sources:
       - path: Sources
     info:
+      # IMPORTANT: XcodeGen GENERATES the plist at this path from the
+      # properties below — it overwrites whatever file is sitting there.
+      # Any key that isn't listed here does not exist in the built app.
+      # v1 crashed on launch (TCC kill) because the usage strings lived
+      # only in the hand-written Sources/Info.plist and were discarded.
       path: Sources/Info.plist
+      properties:
+        CFBundleDisplayName: SelfShot
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+        NSCameraUsageDescription: SelfShot uses the camera to take your photos and video.
+        NSMicrophoneUsageDescription: SelfShot records audio while shooting video.
+        NSPhotoLibraryAddUsageDescription: SelfShot saves the photos and video it captures to your library.
+        NSMotionUsageDescription: SelfShot uses motion data to show a horizon level.
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.selfshot.app
