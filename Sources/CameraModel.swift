@@ -47,10 +47,21 @@ enum LensChoice: String, CaseIterable, Identifiable {
     }
 }
 
-@MainActor
+/// NOTE ON THREADING — this is what crashed v1.
+///
+/// This class is deliberately NOT `@MainActor`. An AVCaptureSession must be
+/// configured off the main thread (configuration blocks for hundreds of ms),
+/// so the capture graph is owned exclusively by `sessionQueue`. Meanwhile
+/// SwiftUI requires every `@Published` mutation on the main thread.
+///
+/// The rule here: capture-graph state is touched ONLY inside `sessionQueue`
+/// blocks, and every `@Published` write goes through `publish { }`. Public
+/// methods are called from the main thread, read what they need there, and
+/// hand plain values across the queue boundary — never `self.someProperty`
+/// read from inside a background block.
 final class CameraModel: NSObject, ObservableObject {
 
-    // MARK: - Published state
+    // MARK: - Published state (main thread only)
 
     @Published private(set) var isRunning = false
     @Published private(set) var isRecording = false
@@ -58,11 +69,10 @@ final class CameraModel: NSObject, ObservableObject {
     @Published private(set) var maxPhotoMegapixels: Int = 12
     @Published private(set) var shotsInBurstRemaining: Int = 0
     @Published private(set) var isLocked = false
-    @Published private(set) var focusPoint: CGPoint?
-    @Published var mode: CaptureMode = .photo
-    @Published var lens: LensChoice = .front
+    @Published private(set) var mode: CaptureMode = .photo
+    @Published private(set) var lens: LensChoice = .front
 
-    // MARK: - Capture graph
+    // MARK: - Capture graph (sessionQueue only)
 
     let session = AVCaptureSession()
     private let sessionQueue = DispatchQueue(label: "selfshot.session")
@@ -75,30 +85,57 @@ final class CameraModel: NSObject, ObservableObject {
     /// Photo delegates must be retained until their callbacks fire.
     private var inFlightDelegates: [Int64: PhotoCaptureDelegate] = [:]
 
+    /// sessionQueue's own copy of what we're configured for, so background
+    /// code never reads the @Published versions.
+    private var activeMode: CaptureMode = .photo
+    private var activeLens: LensChoice = .front
+
+    private var burstTimer: DispatchSourceTimer?
+
+    // MARK: - Main-thread publishing helper
+
+    private func publish(_ block: @escaping () -> Void) {
+        if Thread.isMainThread {
+            block()
+        } else {
+            DispatchQueue.main.async(execute: block)
+        }
+    }
+
+    private func report(_ message: String) {
+        publish { self.lastError = message }
+    }
+
     // MARK: - Lifecycle
 
     func start() {
         Task {
-            guard await requestPermissions() else {
-                self.lastError = "Camera or Photos permission denied. Check Settings."
+            let granted = await requestPermissions()
+            guard granted else {
+                self.report("Camera or Photos permission denied — check Settings.")
                 return
             }
-            sessionQueue.async { [weak self] in
-                guard let self else { return }
+            let mode = await MainActor.run { self.mode }
+            let lens = await MainActor.run { self.lens }
+
+            self.sessionQueue.async {
+                self.activeMode = mode
+                self.activeLens = lens
                 self.configureSession()
                 if !self.session.isRunning {
                     self.session.startRunning()
                 }
-                Task { @MainActor in self.isRunning = self.session.isRunning }
+                let running = self.session.isRunning
+                self.publish { self.isRunning = running }
             }
         }
     }
 
     func stop() {
-        sessionQueue.async { [weak self] in
-            guard let self else { return }
+        cancelBurst()
+        sessionQueue.async {
             if self.session.isRunning { self.session.stopRunning() }
-            Task { @MainActor in self.isRunning = false }
+            self.publish { self.isRunning = false }
         }
     }
 
@@ -111,23 +148,25 @@ final class CameraModel: NSObject, ObservableObject {
         return camera && (photos == .authorized || photos == .limited)
     }
 
-    // MARK: - Session configuration
+    // MARK: - Session configuration (sessionQueue only)
 
-    /// Called on `sessionQueue`.
     private func configureSession() {
         session.beginConfiguration()
-        defer { session.commitConfiguration() }
 
         // `.photo` is required for 24MP / 48MP support. For video we swap to a
         // 4K preset, since the photo preset caps movie output resolution.
-        let wantedPreset: AVCaptureSession.Preset = (mode == .photo) ? .photo : .hd4K3840x2160
+        let wantedPreset: AVCaptureSession.Preset = (activeMode == .photo) ? .photo : .hd4K3840x2160
         if session.canSetSessionPreset(wantedPreset) {
             session.sessionPreset = wantedPreset
+        } else if session.canSetSessionPreset(.high) {
+            session.sessionPreset = .high
         }
 
         configureVideoInput()
         configureAudioInput()
         configureOutputs()
+
+        session.commitConfiguration()
     }
 
     private func configureVideoInput() {
@@ -136,21 +175,23 @@ final class CameraModel: NSObject, ObservableObject {
             videoDeviceInput = nil
         }
 
-        guard let device = resolveDevice(for: lens) else {
-            Task { @MainActor in self.lastError = "No camera found for \(self.lens.rawValue)." }
+        guard let device = resolveDevice(for: activeLens) else {
+            report("No camera available for \(activeLens.rawValue).")
             return
         }
 
         do {
             let input = try AVCaptureDeviceInput(device: device)
-            if session.canAddInput(input) {
-                session.addInput(input)
-                videoDeviceInput = input
-                applyZoom(on: device)
-                reportMaxResolution(for: device)
+            guard session.canAddInput(input) else {
+                report("Couldn't attach the \(activeLens.rawValue) camera.")
+                return
             }
+            session.addInput(input)
+            videoDeviceInput = input
+            applyZoom(on: device)
+            reportMaxResolution(for: device)
         } catch {
-            Task { @MainActor in self.lastError = "Couldn't open camera: \(error.localizedDescription)" }
+            report("Couldn't open camera: \(error.localizedDescription)")
         }
     }
 
@@ -161,7 +202,7 @@ final class CameraModel: NSObject, ObservableObject {
             session.removeInput(existing)
             audioDeviceInput = nil
         }
-        guard mode == .video,
+        guard activeMode == .video,
               let mic = AVCaptureDevice.default(for: .audio),
               let input = try? AVCaptureDeviceInput(device: mic),
               session.canAddInput(input) else { return }
@@ -170,7 +211,7 @@ final class CameraModel: NSObject, ObservableObject {
     }
 
     private func configureOutputs() {
-        switch mode {
+        switch activeMode {
         case .photo:
             if session.outputs.contains(movieOutput) { session.removeOutput(movieOutput) }
             if !session.outputs.contains(photoOutput), session.canAddOutput(photoOutput) {
@@ -187,12 +228,9 @@ final class CameraModel: NSObject, ObservableObject {
                 if connection.isVideoStabilizationSupported {
                     connection.preferredVideoStabilizationMode = .auto
                 }
-                // The front sensor is physically mounted portrait-up; without
-                // this, front-camera video comes out mirrored relative to the
-                // preview you were looking at.
                 if connection.isVideoMirroringSupported {
                     connection.automaticallyAdjustsVideoMirroring = false
-                    connection.isVideoMirrored = (lens == .front)
+                    connection.isVideoMirrored = activeLens.isFront
                 }
             }
         }
@@ -201,11 +239,13 @@ final class CameraModel: NSObject, ObservableObject {
     private func configurePhotoOutput() {
         photoOutput.maxPhotoQualityPrioritization = .quality
 
-        if let device = videoDeviceInput?.device,
-           let best = device.activeFormat.supportedMaxPhotoDimensions.max(by: {
-               Int($0.width) * Int($0.height) < Int($1.width) * Int($1.height)
-           }) {
-            photoOutput.maxPhotoDimensions = best
+        if let device = videoDeviceInput?.device {
+            let dimensions = device.activeFormat.supportedMaxPhotoDimensions
+            if let best = dimensions.max(by: {
+                Int($0.width) * Int($0.height) < Int($1.width) * Int($1.height)
+            }) {
+                photoOutput.maxPhotoDimensions = best
+            }
         }
 
         // Deferred processing hands you a lightweight proxy immediately and
@@ -236,6 +276,7 @@ final class CameraModel: NSObject, ObservableObject {
         // physical lenses automatically instead of us picking one by hand.
         return AVCaptureDevice.default(.builtInTripleCamera, for: .video, position: .back)
             ?? AVCaptureDevice.default(.builtInDualWideCamera, for: .video, position: .back)
+            ?? AVCaptureDevice.default(.builtInDualCamera, for: .video, position: .back)
             ?? AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back)
     }
 
@@ -252,19 +293,20 @@ final class CameraModel: NSObject, ObservableObject {
     }
 
     private func applyZoom(on device: AVCaptureDevice) {
-        guard !lens.isFront else { return }
+        guard !activeLens.isFront else { return }
         do {
             try device.lockForConfiguration()
             defer { device.unlockForConfiguration() }
 
             let base = displayZoomBase(for: device)
-            var target = lens.displayZoom * base
+            var target = activeLens.displayZoom * base
 
             // Snap to an exact switchover point when we're close to one. This
             // is what guarantees 4x actually engages the physical telephoto
             // rather than digitally cropping the main sensor.
             let switchovers = device.virtualDeviceSwitchOverVideoZoomFactors.map { CGFloat(truncating: $0) }
-            if let nearest = switchovers.min(by: { abs($0 - target) < abs($1 - target) }),
+            if target > 0,
+               let nearest = switchovers.min(by: { abs($0 - target) < abs($1 - target) }),
                abs(nearest - target) / target < 0.08 {
                 target = nearest
             }
@@ -276,13 +318,47 @@ final class CameraModel: NSObject, ObservableObject {
         }
     }
 
+    private func reportMaxResolution(for device: AVCaptureDevice) {
+        let best = device.activeFormat.supportedMaxPhotoDimensions.map {
+            Int($0.width) * Int($0.height)
+        }.max() ?? 12_000_000
+        let megapixels = Int((Double(best) / 1_000_000).rounded())
+        publish { self.maxPhotoMegapixels = max(megapixels, 1) }
+    }
+
+    // MARK: - Reconfiguration (called from main)
+
+    func switchLens(to newLens: LensChoice) {
+        guard newLens != lens else { return }
+        lens = newLens
+        cancelBurst()
+        sessionQueue.async {
+            self.activeLens = newLens
+            self.session.beginConfiguration()
+            self.configureVideoInput()
+            self.configureOutputs()
+            self.session.commitConfiguration()
+            self.publish { self.isLocked = false }
+        }
+    }
+
+    func switchMode(to newMode: CaptureMode) {
+        guard newMode != mode else { return }
+        mode = newMode
+        cancelBurst()
+        sessionQueue.async {
+            self.activeMode = newMode
+            self.configureSession()
+        }
+    }
+
     // MARK: - Focus & exposure
 
     /// `point` is in capture-device space (0,0 top-left → 1,1 bottom-right),
     /// already converted by the preview layer.
     func focusAndExpose(at point: CGPoint) {
-        sessionQueue.async { [weak self] in
-            guard let self, let device = self.videoDeviceInput?.device else { return }
+        sessionQueue.async {
+            guard let device = self.videoDeviceInput?.device else { return }
             do {
                 try device.lockForConfiguration()
                 defer { device.unlockForConfiguration() }
@@ -299,14 +375,11 @@ final class CameraModel: NSObject, ObservableObject {
                 if device.isExposureModeSupported(.autoExpose) {
                     device.exposureMode = .autoExpose
                 }
-                device.isSubjectAreaChangeMonitoringEnabled = true
             } catch {
-                Task { @MainActor in self.lastError = "Focus failed: \(error.localizedDescription)" }
+                self.report("Focus failed: \(error.localizedDescription)")
+                return
             }
-            Task { @MainActor in
-                self.isLocked = false
-                self.focusPoint = point
-            }
+            self.publish { self.isLocked = false }
         }
     }
 
@@ -315,8 +388,8 @@ final class CameraModel: NSObject, ObservableObject {
     /// the wall behind you and drifts exposure between burst frames.
     func toggleLock() {
         let shouldLock = !isLocked
-        sessionQueue.async { [weak self] in
-            guard let self, let device = self.videoDeviceInput?.device else { return }
+        sessionQueue.async {
+            guard let device = self.videoDeviceInput?.device else { return }
             do {
                 try device.lockForConfiguration()
                 defer { device.unlockForConfiguration() }
@@ -337,42 +410,10 @@ final class CameraModel: NSObject, ObservableObject {
                     }
                 }
             } catch {
-                Task { @MainActor in self.lastError = "Lock failed: \(error.localizedDescription)" }
+                self.report("Lock failed: \(error.localizedDescription)")
                 return
             }
-            Task { @MainActor in self.isLocked = shouldLock }
-        }
-    }
-
-    private func reportMaxResolution(for device: AVCaptureDevice) {
-        let best = device.activeFormat.supportedMaxPhotoDimensions.map {
-            Int($0.width) * Int($0.height)
-        }.max() ?? 12_000_000
-        Task { @MainActor in
-            self.maxPhotoMegapixels = Int((Double(best) / 1_000_000).rounded())
-        }
-    }
-
-    // MARK: - Reconfiguration
-
-    func switchLens(to newLens: LensChoice) {
-        guard newLens != lens else { return }
-        lens = newLens
-        sessionQueue.async { [weak self] in
-            guard let self else { return }
-            self.session.beginConfiguration()
-            self.configureVideoInput()
-            self.configureOutputs()
-            self.session.commitConfiguration()
-        }
-    }
-
-    func switchMode(to newMode: CaptureMode) {
-        guard newMode != mode else { return }
-        mode = newMode
-        sessionQueue.async { [weak self] in
-            guard let self else { return }
-            self.configureSession()
+            self.publish { self.isLocked = shouldLock }
         }
     }
 
@@ -381,28 +422,36 @@ final class CameraModel: NSObject, ObservableObject {
     /// Fires `count` frames back to back. Ten frames of you mid-movement beats
     /// one frame of you posing — that's the whole point of this app.
     func captureBurst(count: Int) {
-        guard mode == .photo else { return }
+        guard mode == .photo, count > 0 else { return }
+        cancelBurst()
         shotsInBurstRemaining = count
-        fireNextBurstFrame()
+
+        // ~0.35s spacing keeps expressions varied without thrashing the ISP.
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        timer.schedule(deadline: .now(), repeating: 0.35)
+        timer.setEventHandler { [weak self] in
+            guard let self else { return }
+            guard self.shotsInBurstRemaining > 0 else {
+                self.cancelBurst()
+                return
+            }
+            self.capturePhoto()
+            SoundCue.shutter()
+            self.shotsInBurstRemaining -= 1
+        }
+        burstTimer = timer
+        timer.resume()
     }
 
-    private func fireNextBurstFrame() {
-        guard shotsInBurstRemaining > 0 else { return }
-        capturePhoto()
-        SoundCue.shutter()
-        shotsInBurstRemaining -= 1
-        if shotsInBurstRemaining > 0 {
-            // ~0.35s spacing keeps expressions varied without thrashing the ISP.
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
-                self?.fireNextBurstFrame()
-            }
-        }
+    func cancelBurst() {
+        burstTimer?.cancel()
+        burstTimer = nil
+        publish { self.shotsInBurstRemaining = 0 }
     }
 
     private func capturePhoto() {
-        let isFront = lens.isFront
-        sessionQueue.async { [weak self] in
-            guard let self else { return }
+        sessionQueue.async {
+            guard self.session.isRunning, self.session.outputs.contains(self.photoOutput) else { return }
 
             let settings: AVCapturePhotoSettings
             if self.photoOutput.availablePhotoCodecTypes.contains(.hevc) {
@@ -419,16 +468,16 @@ final class CameraModel: NSObject, ObservableObject {
                 connection.automaticallyAdjustsVideoMirroring = false
                 // Mirrored front shots match what you saw in the preview, which
                 // is also the version of your face you're used to seeing.
-                connection.isVideoMirrored = isFront
+                connection.isVideoMirrored = self.activeLens.isFront
             }
 
+            let id = settings.uniqueID
             let delegate = PhotoCaptureDelegate { [weak self] error in
-                Task { @MainActor in
-                    if let error { self?.lastError = error }
-                    self?.inFlightDelegates[settings.uniqueID] = nil
-                }
+                guard let self else { return }
+                if let error { self.report(error) }
+                self.sessionQueue.async { self.inFlightDelegates[id] = nil }
             }
-            Task { @MainActor in self.inFlightDelegates[settings.uniqueID] = delegate }
+            self.inFlightDelegates[id] = delegate
             self.photoOutput.capturePhoto(with: settings, delegate: delegate)
         }
     }
@@ -436,14 +485,16 @@ final class CameraModel: NSObject, ObservableObject {
     // MARK: - Video capture
 
     func toggleRecording() {
-        guard mode == .video else { return }
-        if movieOutput.isRecording {
-            movieOutput.stopRecording()
-        } else {
-            let url = FileManager.default.temporaryDirectory
-                .appendingPathComponent("selfshot-\(UUID().uuidString).mov")
-            movieOutput.startRecording(to: url, recordingDelegate: self)
-            isRecording = true
+        sessionQueue.async {
+            if self.movieOutput.isRecording {
+                self.movieOutput.stopRecording()
+            } else {
+                guard self.session.outputs.contains(self.movieOutput) else { return }
+                let url = FileManager.default.temporaryDirectory
+                    .appendingPathComponent("selfshot-\(UUID().uuidString).mov")
+                self.movieOutput.startRecording(to: url, recordingDelegate: self)
+                self.publish { self.isRecording = true }
+            }
         }
     }
 }
@@ -451,26 +502,25 @@ final class CameraModel: NSObject, ObservableObject {
 // MARK: - Movie delegate
 
 extension CameraModel: AVCaptureFileOutputRecordingDelegate {
-    nonisolated func fileOutput(_ output: AVCaptureFileOutput,
-                                didFinishRecordingTo outputFileURL: URL,
-                                from connections: [AVCaptureConnection],
-                                error: Error?) {
-        Task { @MainActor in
-            self.isRecording = false
-            if let error {
-                self.lastError = "Recording failed: \(error.localizedDescription)"
-                return
-            }
+    func fileOutput(_ output: AVCaptureFileOutput,
+                    didFinishRecordingTo outputFileURL: URL,
+                    from connections: [AVCaptureConnection],
+                    error: Error?) {
+        publish { self.isRecording = false }
+
+        if let error {
+            report("Recording failed: \(error.localizedDescription)")
+            try? FileManager.default.removeItem(at: outputFileURL)
+            return
         }
+
         PHPhotoLibrary.shared().performChanges {
             PHAssetCreationRequest.forAsset()
                 .addResource(with: .video, fileURL: outputFileURL, options: nil)
-        } completionHandler: { _, error in
+        } completionHandler: { [weak self] _, error in
             try? FileManager.default.removeItem(at: outputFileURL)
             if let error {
-                Task { @MainActor in
-                    self.lastError = "Couldn't save video: \(error.localizedDescription)"
-                }
+                self?.report("Couldn't save video: \(error.localizedDescription)")
             }
         }
     }
@@ -478,7 +528,7 @@ extension CameraModel: AVCaptureFileOutputRecordingDelegate {
 
 // MARK: - Photo delegate
 
-private final class PhotoCaptureDelegate: NSObject, AVCapturePhotoCaptureDelegate {
+final class PhotoCaptureDelegate: NSObject, AVCapturePhotoCaptureDelegate {
     private let onFinish: (String?) -> Void
 
     init(onFinish: @escaping (String?) -> Void) {
@@ -496,13 +546,13 @@ private final class PhotoCaptureDelegate: NSObject, AVCapturePhotoCaptureDelegat
     }
 
     func photoOutput(_ output: AVCapturePhotoOutput,
-                     didFinishCapturingDeferredPhotoProxy proxy: AVCaptureDeferredPhotoProxy?,
+                     didFinishCapturingDeferredPhotoProxy deferredPhotoProxy: AVCaptureDeferredPhotoProxy?,
                      error: Error?) {
         if let error {
             onFinish("Deferred capture failed: \(error.localizedDescription)")
             return
         }
-        save(proxy?.fileDataRepresentation())
+        save(deferredPhotoProxy?.fileDataRepresentation())
     }
 
     private func save(_ data: Data?) {

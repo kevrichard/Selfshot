@@ -88,7 +88,7 @@ struct ContentView: View {
             }
 
             Button { showGrid.toggle() } label: {
-                chip("Grid", system: showGrid ? "grid" : "grid", tint: showGrid ? .yellow : .white)
+                chip("Grid", system: "square.grid.3x3", tint: showGrid ? .yellow : .white)
             }
 
             Spacer()
@@ -280,6 +280,7 @@ struct ContentView: View {
         timer = nil
         ticksRemaining = nil
         roundsRemaining = 0
+        camera.cancelBurst()
         if camera.isRecording { camera.toggleRecording() }
     }
 }

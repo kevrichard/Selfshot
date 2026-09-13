@@ -37,7 +37,8 @@ struct GridOverlay: View {
     }
 }
 
-@MainActor
+/// Deliberately not `@MainActor` — CoreMotion delivers to the main queue
+/// already, and a MainActor deinit touching the manager is its own headache.
 final class LevelReader: ObservableObject {
     @Published var rollDegrees: Double = 0
 
